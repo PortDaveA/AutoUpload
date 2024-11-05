@@ -118,11 +118,9 @@ Email notifications include:
 
 ## Contributing
 
-[Add contribution guidelines if applicable]
+[Feel free to suggest useful extensions.]
 
-## License
 
-[Add your license information here]
 
 ---
 
