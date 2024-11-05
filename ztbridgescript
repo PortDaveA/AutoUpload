@@ -1,0 +1,332 @@
+// Configuration
+var NOTIFICATION_EMAIL = "your-notification-email@domain.com";
+var CLIENT_ID = 'YOUR_ZOOM_CLIENT_ID';
+var CLIENT_SECRET = 'YOUR_ZOOM_CLIENT_SECRET';
+var ACCOUNT_ID = 'YOUR_ZOOM_ACCOUNT_ID';
+var FOLDER_ID = "YOUR_GOOGLE_DRIVE_FOLDER_ID";
+var YOUTUBE_CLIENT_ID = 'YOUR_YOUTUBE_CLIENT_ID.apps.googleusercontent.com';
+var YOUTUBE_CLIENT_SECRET = 'YOUR_YOUTUBE_CLIENT_SECRET';
+var YOUTUBE_REFRESH_TOKEN = 'YOUR_YOUTUBE_REFRESH_TOKEN';
+
+// Function to mark a file as uploaded
+function saveUploadedFile(fileId) {
+  var uploadedFiles = PropertiesService.getScriptProperties().getProperty('uploadedFiles');
+  if (uploadedFiles) {
+    uploadedFiles = JSON.parse(uploadedFiles);
+  } else {
+    uploadedFiles = [];
+  }
+  uploadedFiles.push(fileId);
+  PropertiesService.getScriptProperties().setProperty('uploadedFiles', JSON.stringify(uploadedFiles));
+}
+
+// Function to check if a file has already been uploaded
+function isFileUploaded(fileId) {
+  var uploadedFiles = PropertiesService.getScriptProperties().getProperty('uploadedFiles');
+  if (uploadedFiles) {
+    uploadedFiles = JSON.parse(uploadedFiles);
+    return uploadedFiles.includes(fileId);
+  }
+  return false;
+}
+
+function createTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    ScriptApp.deleteTrigger(triggers[i]);
+  }
+  
+  ScriptApp.newTrigger('checkNewFiles')
+    .timeBased()
+    .everyMinutes(5)
+    .create();
+    
+  var now = new Date().getTime();
+  PropertiesService.getScriptProperties().setProperty('lastCheckTime', now.toString());
+  
+  Logger.log('Trigger created - script will run every 5 minutes');
+  sendNotification(
+    "Script Started",
+    "The upload script has been started and will check for new files every 5 minutes.\n" +
+    "First check will occur at: " + new Date(now + (5 * 60000)).toLocaleString() + "\n" +
+    "The script will automatically check for new MP4 files and upload them to Zoom Clips and YouTube."
+  );
+}
+
+function getServerToServerToken() {
+  var url = 'https://zoom.us/oauth/token';
+  var options = {
+    'method': 'post',
+    'headers': {
+      'Authorization': 'Basic ' + Utilities.base64Encode(CLIENT_ID + ':' + CLIENT_SECRET)
+    },
+    'payload': {
+      'grant_type': 'account_credentials',
+      'account_id': ACCOUNT_ID,
+      'scope': 'clips:write clips:write:admin'
+    },
+    'muteHttpExceptions': true
+  };
+  
+  var response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() === 200) {
+    var json = JSON.parse(response.getContentText());
+    return json.access_token;
+  }
+  
+  Logger.log("Failed to get token: " + response.getContentText());
+  return null;
+}
+
+function getYouTubeAccessToken() {
+  var url = 'https://oauth2.googleapis.com/token';
+  var payload = {
+    client_id: YOUTUBE_CLIENT_ID,
+    client_secret: YOUTUBE_CLIENT_SECRET,
+    refresh_token: YOUTUBE_REFRESH_TOKEN,
+    grant_type: 'refresh_token'
+  };
+  
+  var options = {
+    method: 'post',
+    payload: payload,
+    muteHttpExceptions: true
+  };
+  
+  var response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() === 200) {
+    var json = JSON.parse(response.getContentText());
+    return json.access_token;
+  } else {
+    Logger.log('Failed to get YouTube access token: ' + response.getContentText());
+    return null;
+  }
+}
+
+function initiateYouTubeUpload(fileName, title, description) {
+  var accessToken = getYouTubeAccessToken();
+  if (!accessToken) {
+    throw new Error('YouTube access token fetch failed');
+  }
+  
+  var url = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status';
+  var metadata = {
+    snippet: {
+      title: title,
+      description: description,
+      tags: ['sample'],
+      categoryId: '22'
+    },
+    status: {
+      privacyStatus: 'private'
+    }
+  };
+
+  var options = {
+    method: 'post',
+    headers: {
+      Authorization: 'Bearer ' + accessToken,
+      'Content-Type': 'application/json; charset=UTF-8',
+      'X-Upload-Content-Type': 'video/mp4'
+    },
+    payload: JSON.stringify(metadata),
+    muteHttpExceptions: true
+  };
+  
+  var response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() === 200 || response.getResponseCode() === 201) {
+    return response.getHeaders()['Location'];
+  } else {
+    throw new Error('Failed to initiate YouTube upload: ' + response.getContentText());
+  }
+}
+
+function uploadChunkedFile(fileBlob, uploadUrl) {
+  var chunkSize = 5242880; // 5MB
+  var fileSize = fileBlob.getBytes().length;
+  var bytesUploaded = 0;
+
+  while (bytesUploaded < fileSize) {
+    var endByte = Math.min(bytesUploaded + chunkSize, fileSize);
+    var chunk = fileBlob.getBytes().slice(bytesUploaded, endByte);
+    
+    var headers = {
+      'Content-Type': 'video/mp4'
+    };
+
+    if (endByte < fileSize) {
+      headers['Content-Range'] = 'bytes ' + bytesUploaded + '-' + (endByte - 1) + '/' + fileSize;
+    } else {
+      headers['Content-Range'] = 'bytes ' + bytesUploaded + '-' + (fileSize - 1) + '/' + fileSize;
+    }
+
+    Logger.log("Uploading chunk: " + (bytesUploaded / chunkSize + 1));
+    Logger.log("Chunk size: " + chunk.length + " bytes");
+    Logger.log("Content-Range: " + headers['Content-Range']);
+
+    var options = {
+      method: 'put',
+      headers: headers,
+      payload: chunk,
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(uploadUrl, options);
+    
+    if (response.getResponseCode() === 308) {
+      var rangeHeader = response.getHeaders()['Range'];
+      if (rangeHeader) {
+        bytesUploaded = parseInt(rangeHeader.split('-')[1]) + 1;
+      } else {
+        bytesUploaded = endByte;
+      }
+      Logger.log("Resumed upload at byte: " + bytesUploaded);
+    } else if (response.getResponseCode() === 200 || response.getResponseCode() === 201) {
+      Logger.log('Upload completed successfully');
+      return JSON.parse(response.getContentText());
+    } else {
+      Logger.log("Error response: " + response.getResponseCode() + " - " + response.getContentText());
+      throw new Error('Chunk upload failed: ' + response.getContentText());
+    }
+  }
+}
+
+function uploadToYouTube(fileBlob, title, description) {
+  try {
+    var uploadUrl = initiateYouTubeUpload(fileBlob.getName(), title, description);
+    var videoDetails = uploadChunkedFile(fileBlob, uploadUrl);
+    Logger.log('Uploaded video to YouTube: ' + videoDetails.id);
+    return videoDetails;
+  } catch (error) {
+    Logger.log('Error uploading to YouTube: ' + error.message);
+    return null;
+  }
+}
+
+function checkNewFiles() {
+  var folder = DriveApp.getFolderById(FOLDER_ID);
+  var lastCheckTime = parseInt(PropertiesService.getScriptProperties().getProperty('lastCheckTime') || "0");
+  var currentTime = new Date().getTime();
+  
+  Logger.log('Starting check at: ' + new Date(currentTime).toLocaleString());
+  
+  var files = folder.getFilesByType("video/mp4");
+  var processedFiles = [];
+  
+  while (files.hasNext()) {
+    var file = files.next();
+    var fileDate = file.getDateCreated().getTime();
+    var fileId = file.getId();
+    
+    if (fileDate > lastCheckTime && !isFileUploaded(fileId)) {
+      Logger.log('Found new file: ' + file.getName());
+      
+      var accessToken = getServerToServerToken();
+      if (!accessToken) {
+        Logger.log("Failed to get access token");
+        continue;
+      }
+      
+      try {
+        var fileBlob = file.getBlob().setContentType("video/mp4");
+        var result = uploadToZoomClips(fileBlob, file.getName(), accessToken);
+        processedFiles.push({
+          name: file.getName(),
+          success: true,
+          clipId: result.clips_id
+        });
+        
+        uploadToYouTube(fileBlob, file.getName(), "Uploaded via script");
+        saveUploadedFile(fileId);
+
+      } catch (e) {
+        processedFiles.push({
+          name: file.getName(),
+          success: false,
+          error: e.toString()
+        });
+        Logger.log('Error uploading: ' + e.toString());
+      }
+    } else {
+      Logger.log('Skipping already uploaded file: ' + file.getName());
+    }
+  }
+  
+  if (processedFiles.length > 0) {
+    var summary = "Check completed at " + new Date(currentTime).toLocaleString() + "\n\n";
+    processedFiles.forEach(function(file) {
+      if (file.success) {
+        summary += "✓ " + file.name + " uploaded successfully (Clip ID: " + file.clipId + ")\n";
+      } else {
+        summary += "❌ " + file.name + " failed: " + file.error + "\n";
+      }
+    });
+    summary += "\nNext check will be at: " + new Date(currentTime + (5 * 60000)).toLocaleString();
+    
+    sendNotification("Upload Summary", summary);
+  }
+  
+  PropertiesService.getScriptProperties().setProperty('lastCheckTime', currentTime.toString());
+}
+
+function uploadToZoomClips(fileBlob, fileName, accessToken) {
+  var url = "https://fileapi.zoom.us/v2/clips/files";
+  
+  Logger.log('Starting upload for: ' + fileName);
+  
+  var formData = {
+    'file': fileBlob
+  };
+  
+  var options = {
+    method: 'post',
+    headers: {
+      "Authorization": "Bearer " + accessToken
+    },
+    payload: formData,
+    muteHttpExceptions: true
+  };
+  
+  var response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() === 201) {
+    var result = JSON.parse(response.getContentText());
+    Logger.log('Successfully uploaded: ' + fileName);
+    return result;
+  } else {
+    throw new Error('Upload failed: ' + response.getContentText());
+  }
+}
+
+function checkTriggerStatus() {
+  var triggers = ScriptApp.getProjectTriggers();
+  var status = "";
+  
+  if (triggers.length > 0) {
+    status = "✓ Script is ACTIVE\n";
+    status += "Checking for new files every 5 minutes\n";
+    var lastCheck = PropertiesService.getScriptProperties().getProperty('lastCheckTime');
+    if (lastCheck) {
+      var nextCheck = new Date(parseInt(lastCheck) + (5 * 60000));
+      status += "Next check will be at: " + nextCheck.toLocaleString();
+    }
+  } else {
+    status = "❌ Script is NOT RUNNING\n";
+    status += "Run createTrigger() to start automatic checking";
+  }
+  
+  Logger.log(status);
+  sendNotification("Script Status", status);
+}
+
+function sendNotification(subject, body) {
+  if (NOTIFICATION_EMAIL) {
+    MailApp.sendEmail({
+      to: NOTIFICATION_EMAIL,
+      subject: "Zoom Upload: " + subject,
+      body: body
+    });
+  }
+  Logger.log(subject + ": " + body);
+}
